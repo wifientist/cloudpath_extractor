@@ -21,20 +21,15 @@ Supports Cloudpath 5.11+ using the `/admin/publicApi` endpoint with JWT authenti
 
 ## Usage
 
-### Full Extraction (all endpoints)
+### List Available DPSK Pools (Default)
+
+When run without arguments, the script lists all available DPSK pools:
 
 ```bash
 python cloudpath_extractor.py
 ```
 
-Discovers and extracts all available endpoints including:
-- Authentication servers (with users and groups)
-- RADIUS attribute groups
-- Certificate templates
-- DPSK pools (with DPSKs and devices)
-- Enrollments
-- Policies
-- And more...
+Output shows pool IDs, names, SSID lists, and DPSK counts to help you choose which pool to extract.
 
 ### Extract from a Specific DPSK Pool
 
@@ -42,25 +37,76 @@ Discovers and extracts all available endpoints including:
 python cloudpath_extractor.py --pool-id AccountDpskPool-e0b5b92b-600f-4620-81f8-4faaa68a013c
 ```
 
-Runs full extraction but only pulls DPSKs from the specified pool.
+Extracts all DPSKs from the specified pool. This is the primary usage mode.
 
-### Fast DPSK-Only Mode
+### Filter by SSID
 
 ```bash
-python cloudpath_extractor.py --dpsk-only --pool-id AccountDpskPool-e0b5b92b-600f-4620-81f8-4faaa68a013c
+python cloudpath_extractor.py -p AccountDpskPool-... --ssid-match "@Avalon"
 ```
 
-Skips all endpoint discovery and other resources. Directly hits `/dpskPools/{id}/dpsks` for minimal, fast extraction.
+Only returns DPSKs whose SSID list contains the specified string. Uses "contains" matching.
 
-### Command-Line Options
+**SSID Inheritance:** DPSKs can inherit their SSID list from the parent pool. If a DPSK has an empty `ssidList`, the filter checks against the pool's SSID list instead. The output will populate empty `ssidList` fields with the inherited pool values.
+
+### Filter by Name
+
+```bash
+python cloudpath_extractor.py -p AccountDpskPool-... --name-match "chris"
+```
+
+Only returns DPSKs whose name contains the specified string (case-insensitive).
+
+### Filter and Strip from Name
+
+```bash
+python cloudpath_extractor.py -p AccountDpskPool-... --name-match-and-strip "avalon_foo"
+```
+
+Filters DPSKs by name (like `--name-match`) AND removes the matched string from the output names.
+
+Example transformation:
+- `chris13_avalon_foo_fast` becomes `chris13_fast`
+
+The script handles double delimiters that may result from removal (e.g., `__` becomes `_`). The original name is preserved in an `originalName` field.
+
+### Fetch Full DPSK Details
+
+```bash
+python cloudpath_extractor.py -p AccountDpskPool-... --full-details
+```
+
+Fetches complete details for each DPSK individually. This is slower but captures all fields including any SSID overrides specific to each DPSK.
+
+### Extract All Pools (Use with Caution)
+
+```bash
+python cloudpath_extractor.py --all-pools-yes-really
+```
+
+Extracts DPSKs from ALL pools. This can be slow and generate large output files. Requires explicit confirmation flag.
+
+### Combining Filters
+
+Filters can be combined:
+
+```bash
+python cloudpath_extractor.py -p AccountDpskPool-... --ssid-match "@SiteA" --name-match "guest" --full-details
+```
+
+## Command-Line Options
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--pool-id` | `-p` | Extract DPSKs only from this specific pool ID/GUID |
-| `--dpsk-only` | | Fast mode: only extract DPSKs (requires `--pool-id`) |
+| `--pool-id` | `-p` | Extract DPSKs from this specific pool ID/GUID |
+| `--ssid-match` | | Filter DPSKs to those with this string in their SSID list |
+| `--name-match` | | Filter DPSKs to those with this string in their name |
+| `--name-match-and-strip` | | Filter by name AND remove matched string from output names |
+| `--full-details` | | Fetch full details for each DPSK (slower, but complete) |
+| `--all-pools-yes-really` | | Extract from ALL pools (requires explicit flag) |
 | `--output-dir` | `-o` | Output directory for JSON files (default: `./output`) |
 
-### Environment Variables
+## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -81,7 +127,7 @@ cloudpath_{fqdn}_{timestamp}.json
 
 The script maintains only the last 5 output files, automatically deleting older ones.
 
-### Example Output (DPSK-only mode)
+### Example Output
 
 ```json
 {
@@ -97,10 +143,21 @@ The script maintains only the last 5 output files, automatically deleting older 
       "name": "User1",
       "passphrase": "abc123",
       "status": "ACTIVE",
+      "ssidList": ["Corp-WiFi", "Guest-WiFi"],
       "vlanid": "100",
       "deviceCount": 2
     }
   ]
+}
+```
+
+When using `--name-match-and-strip`, entries include both modified and original names:
+
+```json
+{
+  "name": "chris13_fast",
+  "originalName": "chris13_avalon_foo_fast",
+  ...
 }
 ```
 

@@ -88,6 +88,10 @@ class CloudpathConfig:
     timeout: int = 30
     page_size: int = 100
     dpsk_pool_id: Optional[str] = None  # Filter to specific DPSK pool by ID/GUID
+    ssid_match: Optional[str] = None  # Filter DPSKs to those with this string in ssidList
+    name_match: Optional[str] = None  # Filter DPSKs to those with this string in name
+    name_match_strip: Optional[str] = None  # Filter by name AND strip matched string from output
+    full_details: bool = False  # Fetch full details for each DPSK (slower)
 
     @property
     def base_url(self) -> str:
@@ -150,41 +154,10 @@ class CloudpathAPIClient:
     and error handling.
     """
 
-    # Known endpoint categories for discovery
-    # Based on Cloudpath 5.11 REST API documentation
-    # Using camelCase as confirmed by testing
-    KNOWN_ENDPOINTS = [
-        # Core resources - confirmed working
-        'authenticationServers',
-        'radiusAttributeGroups',
-        'enrollments',
-        'certificateTemplates',
-        'dpskPools',
-        'policies',
-        # Additional endpoints to probe
-        'radiusClients',
-        'macRegistrations',
-        'macRegistrationList',  # Alternative naming per API docs
-        'registrationLists',  # MAC registration lists
-        'networkSegmentationGroups',
-        'smsCountryCodes',
-        'workflows',
-        'deviceConfigurations',
-        'ssids',
-        'onboardDevices',
-        'sponsors',
-        'guestAccounts',
-        'cas',
-        'tenants',
-        'portals',
-        'properties',  # MDU property management
-    ]
-
     def __init__(self, config: CloudpathConfig):
         self.config = config
         self.token_info: Optional[TokenInfo] = None
         self.session = self._create_session()
-        self.discovered_endpoints: dict[str, bool] = {}
 
     def _create_session(self) -> requests.Session:
         """Create a requests session with retry logic."""
@@ -416,46 +389,6 @@ class CloudpathAPIClient:
 
         return all_items
 
-    def discover_endpoints(self) -> dict[str, bool]:
-        """
-        Discover which endpoints are available on this Cloudpath instance.
-
-        Probes known endpoints and records which ones respond successfully.
-        """
-        logger.info("Discovering available API endpoints...")
-
-        status_codes_seen = {}
-
-        for endpoint in self.KNOWN_ENDPOINTS:
-            try:
-                # Try a minimal request to check if endpoint exists
-                response = self._make_request('GET', endpoint, params={'pageSize': 1, 'page': 1})
-
-                # Track status codes for debugging
-                status_codes_seen[response.status_code] = status_codes_seen.get(response.status_code, 0) + 1
-
-                if response.status_code == 200:
-                    self.discovered_endpoints[endpoint] = True
-                    data = response.json()
-                    count = data.get('page', {}).get('totalCount', 'unknown')
-                    logger.info(f"  FOUND: /{endpoint} ({count} items)")
-                elif response.status_code == 404:
-                    self.discovered_endpoints[endpoint] = False
-                    logger.debug(f"  404: /{endpoint}")
-                else:
-                    self.discovered_endpoints[endpoint] = False
-                    logger.debug(f"  {response.status_code}: /{endpoint}")
-
-            except Exception as e:
-                self.discovered_endpoints[endpoint] = False
-                logger.info(f"  ERROR: /{endpoint} - {e}")
-
-        available = [ep for ep, avail in self.discovered_endpoints.items() if avail]
-        logger.info(f"Discovered {len(available)} available endpoints")
-        logger.info(f"Status code summary: {status_codes_seen}")
-
-        return self.discovered_endpoints
-
     def get_server_info(self) -> dict:
         """Get basic server information from the token response."""
         if not self.token_info:
@@ -493,12 +426,185 @@ class CloudpathExtractor:
     """
     Main extraction orchestrator.
 
-    Coordinates the discovery and extraction of all Cloudpath configuration data.
+    Extracts Cloudpath configuration data from known working endpoints.
     """
+
+    # Static list of confirmed working endpoints
+    # Use cloudpath_discovery.py to probe for additional endpoints
+    FUNCTIONAL_ENDPOINTS = [
+        'authenticationServers',
+        'radiusAttributeGroups',
+        'enrollments',
+        'certificateTemplates',
+        'dpskPools',
+        'policies',
+    ]
 
     def __init__(self, client: CloudpathAPIClient):
         self.client = client
         self.data: dict[str, Any] = {}
+
+    def _filter_dpsks(self, dpsks: list, pool_ssid_list: Optional[list] = None) -> list:
+        """
+        Filter DPSKs based on configured filters (ssid_match and/or name_match).
+
+        Both filters must match if both are specified (AND logic).
+        For SSID filtering, if a DPSK has an empty ssidList, it inherits from the pool.
+        Returns the filtered list, or the original list if no filters are configured.
+        """
+        ssid_match = self.client.config.ssid_match
+        name_match = self.client.config.name_match
+        name_match_strip = self.client.config.name_match_strip
+
+        # Use name_match_strip as filter if no name_match specified
+        effective_name_match = name_match or name_match_strip
+
+        if not ssid_match and not effective_name_match:
+            return dpsks
+
+        # Get pool's ssidList as fallback for DPSKs that inherit
+        if pool_ssid_list is None and 'pool' in self.data:
+            pool_ssid_list = self.data['pool'].get('ssidList', [])
+
+        # Convert pool ssidList to string for matching
+        pool_ssids_str = ''
+        if pool_ssid_list:
+            if isinstance(pool_ssid_list, list):
+                pool_ssids_str = ','.join(pool_ssid_list)
+            else:
+                pool_ssids_str = str(pool_ssid_list)
+
+        filtered = []
+        for dpsk in dpsks:
+            if not isinstance(dpsk, dict):
+                continue
+
+            # Check SSID filter
+            if ssid_match:
+                ssid_list = dpsk.get('ssidList', [])
+                # ssidList can be a string (comma-separated) or possibly a list
+                if isinstance(ssid_list, list):
+                    ssid_list_str = ','.join(ssid_list) if ssid_list else ''
+                else:
+                    ssid_list_str = ssid_list or ''
+
+                # If DPSK has no SSIDs, inherit from pool
+                if not ssid_list_str and pool_ssids_str:
+                    ssid_list_str = pool_ssids_str
+                    logger.debug(f"  DPSK '{dpsk.get('name')}' inherits pool SSIDs: {pool_ssids_str[:50]}...")
+
+                if ssid_match not in ssid_list_str:
+                    continue
+
+            # Check name filter
+            if effective_name_match:
+                dpsk_name = dpsk.get('name', '')
+                if effective_name_match not in dpsk_name:
+                    continue
+
+            filtered.append(dpsk)
+
+        # Log filter results
+        filters_applied = []
+        if ssid_match:
+            filters_applied.append(f"ssid='{ssid_match}'")
+        if effective_name_match:
+            filters_applied.append(f"name='{effective_name_match}'")
+        logger.info(f"DPSK filter [{', '.join(filters_applied)}]: {len(filtered)}/{len(dpsks)} matched")
+
+        return filtered
+
+    def _enrich_dpsk_details(self, dpsks: list, pool_id: str) -> list:
+        """
+        Fetch full details for each DPSK by hitting individual endpoints.
+
+        This gets complete data including SSID overrides that may not be
+        returned by the list endpoint.
+        """
+        logger.info(f"Fetching full details for {len(dpsks)} DPSKs...")
+        enriched = []
+
+        for i, dpsk in enumerate(dpsks):
+            if not isinstance(dpsk, dict):
+                enriched.append(dpsk)
+                continue
+
+            dpsk_id = dpsk.get('guid')
+            dpsk_name = dpsk.get('name', dpsk_id)
+
+            if not dpsk_id:
+                enriched.append(dpsk)
+                continue
+
+            try:
+                # Hit the individual DPSK endpoint to get full details
+                full_dpsk = self.client.get(f"dpskPools/{pool_id}/dpsks/{dpsk_id}")
+                enriched.append(full_dpsk)
+
+                # Log progress every 50 DPSKs or for small sets
+                if (i + 1) % 50 == 0 or len(dpsks) <= 10:
+                    logger.info(f"  Enriched {i + 1}/{len(dpsks)} DPSKs")
+
+            except requests.exceptions.HTTPError as e:
+                logger.warning(f"  Could not get details for {dpsk_name}: {e}")
+                enriched.append(dpsk)  # Keep original if fetch fails
+            except Exception as e:
+                logger.debug(f"  Error getting details for {dpsk_name}: {e}")
+                enriched.append(dpsk)
+
+        logger.info(f"Enrichment complete: {len(enriched)} DPSKs")
+        return enriched
+
+    def _strip_from_names(self, dpsks: list, strip_str: str) -> list:
+        """
+        Strip matched string from DPSK names and clean up double delimiters.
+
+        Example: "chris13_avalon_foo_fast" with strip "avalon_foo" -> "chris13_fast"
+        """
+        import re
+
+        for dpsk in dpsks:
+            if not isinstance(dpsk, dict):
+                continue
+
+            name = dpsk.get('name', '')
+            if not name or strip_str not in name:
+                continue
+
+            # Store original name
+            dpsk['originalName'] = name
+
+            # Remove the matched string
+            new_name = name.replace(strip_str, '')
+
+            # Clean up double/triple delimiters (_, -, .)
+            new_name = re.sub(r'[_\-\.]{2,}', lambda m: m.group(0)[0], new_name)
+
+            # Remove leading/trailing delimiters
+            new_name = new_name.strip('_-.')
+
+            dpsk['name'] = new_name
+            logger.debug(f"  Stripped name: '{name}' -> '{new_name}'")
+
+        return dpsks
+
+    def _populate_inherited_ssids(self, dpsks: list, pool_ssid_list: Optional[list] = None) -> list:
+        """
+        Populate ssidList with inherited pool SSIDs for DPSKs that have empty lists.
+        """
+        # Get pool's ssidList if not provided
+        if pool_ssid_list is None and 'pool' in self.data:
+            pool_ssid_list = self.data['pool'].get('ssidList', [])
+
+        for dpsk in dpsks:
+            if not isinstance(dpsk, dict):
+                continue
+
+            # If DPSK has no SSIDs, inherit from pool
+            if not dpsk.get('ssidList'):
+                dpsk['ssidList'] = pool_ssid_list or []
+
+        return dpsks
 
     def extract_dpsk_only(self, pool_id: str) -> dict:
         """
@@ -518,7 +624,8 @@ class CloudpathExtractor:
                 'cloudpath_fqdn': self.client.config.fqdn,
                 'extractor_version': '1.0.0',
                 'mode': 'dpsk_only',
-                'pool_id': pool_id
+                'pool_id': pool_id,
+                'full_details': self.client.config.full_details
             }
         }
 
@@ -543,8 +650,23 @@ class CloudpathExtractor:
         logger.info(f"Fetching DPSKs from pool {pool_id}...")
         try:
             dpsks = self.client.get_all_pages(f"dpskPools/{pool_id}/dpsks")
-            self.data['dpsks'] = dpsks
             logger.info(f"Retrieved {len(dpsks)} DPSKs")
+
+            # Optionally fetch full details for each DPSK
+            if self.client.config.full_details:
+                dpsks = self._enrich_dpsk_details(dpsks, pool_id)
+
+            # Apply filters if configured
+            dpsks = self._filter_dpsks(dpsks)
+
+            # Strip matched string from names if requested
+            if self.client.config.name_match_strip:
+                dpsks = self._strip_from_names(dpsks, self.client.config.name_match_strip)
+
+            # Populate inherited SSIDs
+            dpsks = self._populate_inherited_ssids(dpsks)
+
+            self.data['dpsks'] = dpsks
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
                 logger.warning(f"No DPSKs endpoint for pool: {pool_id}")
@@ -586,15 +708,10 @@ class CloudpathExtractor:
         except Exception as e:
             logger.warning(f"Could not retrieve server info: {e}")
 
-        # Discover available endpoints
-        self.client.discover_endpoints()
+        # Extract data from known functional endpoints
+        logger.info(f"Extracting from {len(self.FUNCTIONAL_ENDPOINTS)} endpoints...")
 
-        # Extract data from each available endpoint
-        available_endpoints = [
-            ep for ep, avail in self.client.discovered_endpoints.items() if avail
-        ]
-
-        for endpoint in available_endpoints:
+        for endpoint in self.FUNCTIONAL_ENDPOINTS:
             self._extract_endpoint(endpoint)
 
         # Extract nested/related resources
@@ -605,11 +722,11 @@ class CloudpathExtractor:
         duration = (end_time - start_time).total_seconds()
 
         self.data['metadata']['extraction_duration_seconds'] = duration
-        self.data['metadata']['endpoints_extracted'] = len(available_endpoints)
+        self.data['metadata']['endpoints_extracted'] = len(self.FUNCTIONAL_ENDPOINTS)
 
         logger.info("=" * 60)
         logger.info(f"Extraction complete in {duration:.1f} seconds")
-        logger.info(f"Extracted {len(available_endpoints)} endpoint categories")
+        logger.info(f"Extracted {len(self.FUNCTIONAL_ENDPOINTS)} endpoint categories")
         logger.info("=" * 60)
 
         return self.data
@@ -819,14 +936,32 @@ class CloudpathExtractor:
             if not pool_id:
                 continue
 
+            # Get pool's ssidList for inheritance fallback
+            pool_ssid_list = pool.get('ssidList', [])
+
             # Skip if already extracted via HATEOAS links
             if 'dpsks' in pool:
                 dpsks = pool['dpsks']
+                # Apply SSID filter if configured (with pool ssidList fallback)
+                dpsks = self._filter_dpsks(dpsks, pool_ssid_list)
+                # Strip matched string from names if requested
+                if self.client.config.name_match_strip:
+                    dpsks = self._strip_from_names(dpsks, self.client.config.name_match_strip)
+                # Populate inherited SSIDs
+                dpsks = self._populate_inherited_ssids(dpsks, pool_ssid_list)
+                pool['dpsks'] = dpsks
             else:
                 try:
                     dpsks = self.client.get_all_pages(f"dpskPools/{pool_id}/dpsks")
-                    pool['dpsks'] = dpsks
                     logger.info(f"  {pool_name}: {len(dpsks)} DPSKs")
+                    # Apply SSID filter if configured (with pool ssidList fallback)
+                    dpsks = self._filter_dpsks(dpsks, pool_ssid_list)
+                    # Strip matched string from names if requested
+                    if self.client.config.name_match_strip:
+                        dpsks = self._strip_from_names(dpsks, self.client.config.name_match_strip)
+                    # Populate inherited SSIDs
+                    dpsks = self._populate_inherited_ssids(dpsks, pool_ssid_list)
+                    pool['dpsks'] = dpsks
                 except requests.exceptions.HTTPError as e:
                     if e.response.status_code != 404:
                         logger.warning(f"  Could not get DPSKs for {pool_name}: {e}")
@@ -946,36 +1081,122 @@ class CloudpathExtractor:
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description='Extract configuration from Cloudpath deployment via REST API.',
+        description='Extract DPSK configuration from Cloudpath deployment via REST API.\n'
+                    'Run without arguments to list available DPSK pools.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Extract everything (all pools)
+  # List available DPSK pools (default behavior)
   python cloudpath_extractor.py
 
-  # Extract DPSKs from a specific pool only
-  python cloudpath_extractor.py --pool-id 12345
+  # Extract DPSKs from a specific pool
+  python cloudpath_extractor.py --pool-id <GUID>
 
-  # Using environment variable instead
-  CP_DPSK_POOL_ID=12345 python cloudpath_extractor.py
+  # Filter DPSKs to only those with a specific SSID
+  python cloudpath_extractor.py --pool-id <GUID> --ssid-match "@sitename_foo"
+
+  # Filter DPSKs by name
+  python cloudpath_extractor.py --pool-id <GUID> --name-match "SiteName"
+
+  # Combine filters (both must match)
+  python cloudpath_extractor.py --pool-id <GUID> --ssid-match "@sitename_x" --name-match "Unit"
+
+  # Fetch full details including per-DPSK SSID overrides (slower)
+  python cloudpath_extractor.py --pool-id <GUID> --full-details
+
+  # Extract ALL pools (use with caution!)
+  python cloudpath_extractor.py --all-pools-yes-really
         """
     )
     parser.add_argument(
         '--pool-id', '-p',
         dest='dpsk_pool_id',
-        help='Extract DPSKs only from this specific pool ID/GUID'
+        help='DPSK pool GUID to extract from (required for extraction)'
     )
     parser.add_argument(
-        '--dpsk-only',
+        '--all-pools-yes-really',
         action='store_true',
-        help='Fast mode: only extract DPSKs from the specified pool (requires --pool-id)'
+        dest='extract_all_pools',
+        help='Extract ALL DPSK pools (use with caution on large deployments)'
     )
     parser.add_argument(
         '--output-dir', '-o',
         dest='output_dir',
         help='Output directory for JSON files (default: ./output)'
     )
+    parser.add_argument(
+        '--ssid-match',
+        dest='ssid_match',
+        help='Filter DPSKs to only those with this string in their ssidList (e.g., "sitename_foo")'
+    )
+    parser.add_argument(
+        '--name-match',
+        dest='name_match',
+        help='Filter DPSKs to only those with this string in their name (e.g., "SiteName")'
+    )
+    parser.add_argument(
+        '--name-match-and-strip',
+        dest='name_match_strip',
+        help='Filter by name AND strip the matched string from output (cleans up double delimiters)'
+    )
+    parser.add_argument(
+        '--full-details',
+        action='store_true',
+        dest='full_details',
+        help='Fetch full details for each DPSK (slower, but gets SSID overrides)'
+    )
     return parser.parse_args()
+
+
+def list_dpsk_pools(client: CloudpathAPIClient) -> int:
+    """
+    Fetch and display available DPSK pools, then exit.
+
+    Returns exit code (0 for success).
+    """
+    print("Fetching available DPSK pools...\n")
+
+    try:
+        pools = client.get_all_pages('dpskPools')
+    except Exception as e:
+        logger.error(f"Failed to fetch DPSK pools: {e}")
+        print(f"Error fetching pools: {e}")
+        return 1
+
+    if not pools:
+        print("No DPSK pools found on this server.")
+        return 0
+
+    print(f"Found {len(pools)} DPSK pool(s):\n")
+    print("-" * 80)
+
+    for pool in pools:
+        guid = pool.get('guid', 'N/A')
+        name = pool.get('displayName') or pool.get('name') or '(unnamed)'
+        description = pool.get('description', '')
+        enabled = pool.get('enabled', False)
+        ssid_list = pool.get('ssidList', [])
+        if isinstance(ssid_list, list):
+            ssids = ', '.join(ssid_list) if ssid_list else '(none)'
+        else:
+            ssids = ssid_list or '(none)'
+
+        status = "enabled" if enabled else "disabled"
+
+        print(f"  Name: {name}")
+        print(f"  GUID: {guid}")
+        if description:
+            print(f"  Description: {description}")
+        print(f"  Status: {status}")
+        print(f"  SSIDs: {ssids}")
+        print("-" * 80)
+
+    print("\nTo extract DPSKs from a specific pool, re-run with:")
+    print(f"  python cloudpath_extractor.py --pool-id <GUID>")
+    print("\nExample:")
+    print(f"  python cloudpath_extractor.py --pool-id \"{pools[0].get('guid')}\"")
+
+    return 0
 
 
 def main():
@@ -994,15 +1215,34 @@ def main():
         if args.dpsk_pool_id:
             config.dpsk_pool_id = args.dpsk_pool_id
 
-        logger.info(f"Target: {config.fqdn}")
+        # Set SSID match filter from command-line
+        if args.ssid_match:
+            config.ssid_match = args.ssid_match
 
-        # Validate --dpsk-only requires --pool-id
-        if args.dpsk_only and not config.dpsk_pool_id:
-            print("Error: --dpsk-only requires --pool-id to be specified")
-            return 1
+        # Set name match filter from command-line
+        if args.name_match:
+            config.name_match = args.name_match
+
+        # Set name match and strip from command-line
+        if args.name_match_strip:
+            config.name_match_strip = args.name_match_strip
+
+        # Set full details mode from command-line
+        if args.full_details:
+            config.full_details = True
+
+        logger.info(f"Target: {config.fqdn}")
 
         if config.dpsk_pool_id:
             logger.info(f"DPSK Pool Filter: {config.dpsk_pool_id}")
+        if config.ssid_match:
+            logger.info(f"SSID Match Filter: {config.ssid_match}")
+        if config.name_match:
+            logger.info(f"Name Match Filter: {config.name_match}")
+        if config.name_match_strip:
+            logger.info(f"Name Match & Strip: {config.name_match_strip}")
+        if config.full_details:
+            logger.info("Full Details Mode: enabled (will fetch each DPSK individually)")
 
         # Create API client
         client = CloudpathAPIClient(config)
@@ -1010,15 +1250,20 @@ def main():
         # Authenticate
         client.authenticate()
 
+        # If no pool ID specified, list available pools and exit (unless --all-pools-yes-really)
+        if not config.dpsk_pool_id and not args.extract_all_pools:
+            return list_dpsk_pools(client)
+
         # Create extractor and run
         extractor = CloudpathExtractor(client)
 
-        if args.dpsk_only:
-            # Fast mode: just get DPSKs from the one pool
-            data = extractor.extract_dpsk_only(config.dpsk_pool_id)
-        else:
-            # Full extraction
+        if args.extract_all_pools:
+            # Full extraction of ALL pools
+            logger.warning("Extracting ALL DPSK pools - this may take a while on large deployments")
             data = extractor.extract_all()
+        else:
+            # Extract from specific pool only
+            data = extractor.extract_dpsk_only(config.dpsk_pool_id)
 
         # Save results
         output_dir = args.output_dir or os.getenv('OUTPUT_DIR', './output')
