@@ -42,7 +42,7 @@ Extracts all DPSKs from the specified pool. This is the primary usage mode.
 ### Filter by SSID
 
 ```bash
-python cloudpath_extractor.py -p AccountDpskPool-... --ssid-match "@Avalon"
+python cloudpath_extractor.py -p AccountDpskPool-... --ssid-match "@SiteName"
 ```
 
 Only returns DPSKs whose SSID list contains the specified string. Uses "contains" matching.
@@ -60,13 +60,13 @@ Only returns DPSKs whose name contains the specified string (case-insensitive).
 ### Filter and Strip from Name
 
 ```bash
-python cloudpath_extractor.py -p AccountDpskPool-... --name-match-and-strip "avalon_foo"
+python cloudpath_extractor.py -p AccountDpskPool-... --name-match-and-strip "sitename_foo"
 ```
 
 Filters DPSKs by name (like `--name-match`) AND removes the matched string from the output names.
 
 Example transformation:
-- `chris13_avalon_foo_fast` becomes `chris13_fast`
+- `chris13_sitename_foo_fast` becomes `chris13_fast`
 
 The script handles double delimiters that may result from removal (e.g., `__` becomes `_`). The original name is preserved in an `originalName` field.
 
@@ -156,7 +156,7 @@ When using `--name-match-and-strip`, entries include both modified and original 
 ```json
 {
   "name": "chris13_fast",
-  "originalName": "chris13_avalon_foo_fast",
+  "originalName": "chris13_sitename_foo_fast",
   ...
 }
 ```
