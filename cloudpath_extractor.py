@@ -10,6 +10,7 @@ Supports Cloudpath 5.11+ using the /admin/publicApi endpoint with JWT authentica
 
 import os
 import sys
+import csv
 import json
 import logging
 import glob
@@ -336,11 +337,20 @@ class CloudpathAPIClient:
 
         return response
 
+    @staticmethod
+    def _strip_links(obj):
+        """Recursively remove HATEOAS 'links' keys from API response data."""
+        if isinstance(obj, dict):
+            return {k: CloudpathAPIClient._strip_links(v) for k, v in obj.items() if k != 'links'}
+        elif isinstance(obj, list):
+            return [CloudpathAPIClient._strip_links(item) for item in obj]
+        return obj
+
     def get(self, endpoint: str, params: Optional[dict] = None) -> dict:
         """Make a GET request to the API."""
         response = self._make_request('GET', endpoint, params=params)
         response.raise_for_status()
-        return response.json()
+        return self._strip_links(response.json())
 
     def get_all_pages(self, endpoint: str, params: Optional[dict] = None) -> list:
         """
@@ -747,94 +757,15 @@ class CloudpathExtractor:
             self.data[key] = {'error': str(e)}
 
     def _extract_nested_resources(self):
-        """Extract nested resources using HATEOAS links from API responses."""
+        """Extract nested resources from known endpoint patterns."""
 
-        logger.info("Extracting nested resources via HATEOAS links...")
+        logger.info("Extracting nested resources...")
 
-        # Process all top-level resources that have items with links
-        for key, items in list(self.data.items()):
-            if key == 'metadata' or not isinstance(items, list):
-                continue
-
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-
-                self._follow_item_links(item, key)
-
-        # Also try known nested patterns for camelCase endpoints
         if 'authenticationServers' in self.data:
             self._extract_auth_server_users()
 
         if 'dpskPools' in self.data:
             self._extract_dpsk_pool_items()
-
-    def _follow_item_links(self, item: dict, parent_key: str):
-        """
-        Follow HATEOAS links in an item to extract nested resources.
-
-        The API returns links like:
-        {"rel": "certificates", "href": "https://.../certificateTemplates/1/certificates?..."}
-        """
-        links = item.get('links', [])
-        if not links:
-            return
-
-        item_name = item.get('name') or item.get('guid') or 'unknown'
-
-        for link in links:
-            if not isinstance(link, dict):
-                continue
-
-            rel = link.get('rel', '')
-            href = link.get('href', '')
-
-            # Skip self-referential links
-            if rel == 'self' or not href:
-                continue
-
-            # Extract the endpoint path from the URL
-            # href can be:
-            #   - Full URL: https://cp.rossho.me/admin/publicApi/certificateTemplates/1/certificates?page=1&pageSize=10
-            #   - Relative with publicApi: publicApi/authenticationServers/1/users
-            #   - Relative with leading slash: /publicApi/authenticationServers/2/users
-            try:
-                endpoint = None
-
-                if '/admin/publicApi/' in href:
-                    # Full URL format
-                    endpoint = href.split('/admin/publicApi/')[1]
-                elif href.startswith('publicApi/'):
-                    # Relative without leading slash
-                    endpoint = href[len('publicApi/'):]
-                elif href.startswith('/publicApi/'):
-                    # Relative with leading slash
-                    endpoint = href[len('/publicApi/'):]
-
-                if endpoint:
-                    # Remove query parameters
-                    endpoint = endpoint.split('?')[0]
-                    # Remove template parameters like {&filter,orderBy}
-                    endpoint = endpoint.split('{')[0]
-                    # Clean up any trailing slashes
-                    endpoint = endpoint.rstrip('/')
-
-                    logger.info(f"  Following link '{rel}' for {parent_key}/{item_name}...")
-
-                    try:
-                        nested_items = self.client.get_all_pages(endpoint)
-                        item[rel] = nested_items
-                        logger.info(f"    Retrieved {len(nested_items)} {rel}")
-                    except requests.exceptions.HTTPError as e:
-                        if e.response.status_code not in (404, 403):
-                            logger.warning(f"    Could not get {rel}: {e}")
-                        item[rel] = []
-                    except Exception as e:
-                        logger.debug(f"    Error getting {rel}: {e}")
-                        item[rel] = []
-
-            except Exception as e:
-                logger.debug(f"  Could not parse link {href}: {e}")
 
     def _extract_auth_server_users(self):
         """Extract users and groups from each authentication server."""
@@ -939,7 +870,7 @@ class CloudpathExtractor:
             # Get pool's ssidList for inheritance fallback
             pool_ssid_list = pool.get('ssidList', [])
 
-            # Skip if already extracted via HATEOAS links
+            # Skip if already extracted
             if 'dpsks' in pool:
                 dpsks = pool['dpsks']
                 # Apply SSID filter if configured (with pool ssidList fallback)
@@ -1037,22 +968,36 @@ class CloudpathExtractor:
         if enriched > 0:
             logger.info(f"  Enriched {enriched} enrollment records")
 
-    def save_to_file(self, output_dir: str = './output', max_files: int = 5) -> Path:
-        """
-        Save extracted data to a JSON file.
+    def _collect_dpsks(self) -> list:
+        """Collect all DPSKs from whichever data structure was used."""
+        dpsks = list(self.data.get('dpsks', []))
+        if not dpsks:
+            for key in ('dpskPools', 'pool'):
+                container = self.data.get(key)
+                if isinstance(container, list):
+                    for pool in container:
+                        if isinstance(pool, dict):
+                            dpsks.extend(pool.get('dpsks', []))
+                elif isinstance(container, dict):
+                    dpsks.extend(container.get('dpsks', []))
+        return dpsks
 
-        Maintains only the last N output files, deleting older ones.
-        Returns the path to the saved file.
+    def save_to_file(self, output_dir: str = './output', max_files: int = 5,
+                     chunk_size: Optional[int] = None) -> list[Path]:
         """
-        # Create output directory if needed
+        Save extracted data to JSON file(s).
+
+        If chunk_size is set, splits DPSKs across multiple files.
+        Returns list of saved file paths.
+        """
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # Clean up old JSON files, keeping only the most recent (max_files - 1)
         fqdn_safe = self.client.config.fqdn.replace('.', '_').replace(':', '_')
+
+        # Clean up old JSON files
         pattern = f"cloudpath_{fqdn_safe}_*.json"
         existing_files = sorted(output_path.glob(pattern), key=os.path.getmtime)
-
         while len(existing_files) >= max_files:
             oldest = existing_files.pop(0)
             try:
@@ -1061,21 +1006,104 @@ class CloudpathExtractor:
             except OSError:
                 pass
 
-        # Generate filename with timestamp
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"cloudpath_{fqdn_safe}_{timestamp}.json"
 
-        filepath = output_path / filename
+        if not chunk_size:
+            # Single file output
+            filepath = output_path / f"cloudpath_{fqdn_safe}_{timestamp}.json"
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2, default=str, ensure_ascii=False)
+            file_size = filepath.stat().st_size
+            logger.info(f"Saved extraction to: {filepath} ({file_size / 1024 / 1024:.2f} MB)")
+            return [filepath]
 
-        # Write JSON with nice formatting
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(self.data, f, indent=2, default=str, ensure_ascii=False)
+        # Chunked output
+        dpsks = self._collect_dpsks()
+        chunks = [dpsks[i:i + chunk_size] for i in range(0, len(dpsks), chunk_size)]
+        saved = []
 
-        file_size = filepath.stat().st_size
-        logger.info(f"Saved extraction to: {filepath}")
-        logger.info(f"File size: {file_size / 1024 / 1024:.2f} MB")
+        for idx, chunk in enumerate(chunks, 1):
+            chunk_data = dict(self.data)
+            chunk_data['dpsks'] = chunk
+            chunk_data['metadata'] = dict(self.data.get('metadata', {}))
+            chunk_data['metadata']['chunk'] = f"{idx}/{len(chunks)}"
+            chunk_data['metadata']['chunk_size'] = len(chunk)
 
-        return filepath
+            filepath = output_path / f"cloudpath_{fqdn_safe}_{timestamp}_chunk{idx}of{len(chunks)}.json"
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(chunk_data, f, indent=2, default=str, ensure_ascii=False)
+            saved.append(filepath)
+            logger.info(f"Saved chunk {idx}/{len(chunks)}: {filepath} ({len(chunk)} DPSKs)")
+
+        return saved
+
+    def export_csv(self, output_dir: str = './output',
+                   chunk_size: Optional[int] = None) -> list[tuple[Path, Path]]:
+        """
+        Export extracted DPSKs as Cloudpath-compatible CSV import files.
+
+        If chunk_size is set, splits across multiple file pairs.
+        Returns list of (dpsk_csv, identity_csv) path tuples.
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        fqdn_safe = self.client.config.fqdn.replace('.', '_').replace(':', '_')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        dpsks = self._collect_dpsks()
+
+        if chunk_size:
+            chunks = [dpsks[i:i + chunk_size] for i in range(0, len(dpsks), chunk_size)]
+        else:
+            chunks = [dpsks]
+
+        results = []
+        for idx, chunk in enumerate(chunks, 1):
+            suffix = f"_chunk{idx}of{len(chunks)}" if len(chunks) > 1 else ""
+
+            # --- DPSK import CSV ---
+            dpsk_csv_path = output_path / f"dpsk_import_{fqdn_safe}_{timestamp}{suffix}.csv"
+            with open(dpsk_csv_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'Username', 'Number of devices', 'MAC Address',
+                    'Passphrase', 'VLAN ID', 'Passphrase Expiration',
+                    'Email', 'PhoneNumber'
+                ])
+                for dpsk in chunk:
+                    if not isinstance(dpsk, dict):
+                        continue
+                    writer.writerow([
+                        dpsk.get('name', ''),
+                        '',  # Number of devices
+                        '',  # MAC Address
+                        dpsk.get('passphrase', ''),
+                        dpsk.get('vlanid', ''),
+                        '',  # Passphrase Expiration
+                        '',  # Email
+                        '',  # PhoneNumber
+                    ])
+
+            # --- Identity import CSV ---
+            identity_csv_path = output_path / f"identity_import_{fqdn_safe}_{timestamp}{suffix}.csv"
+            with open(identity_csv_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Name', 'Email', 'Description', 'Vlan'])
+                for dpsk in chunk:
+                    if not isinstance(dpsk, dict):
+                        continue
+                    writer.writerow([
+                        dpsk.get('name', ''),
+                        '',  # Email
+                        dpsk.get('guid', ''),
+                        dpsk.get('vlanid', ''),
+                    ])
+
+            results.append((dpsk_csv_path, identity_csv_path))
+            logger.info(f"Exported CSV pair{suffix}: {len(chunk)} DPSKs")
+
+        return results
 
 
 def parse_args():
@@ -1144,6 +1172,19 @@ Examples:
         action='store_true',
         dest='full_details',
         help='Fetch full details for each DPSK (slower, but gets SSID overrides)'
+    )
+    parser.add_argument(
+        '--csv',
+        action='store_true',
+        dest='export_csv',
+        help='Also export DPSK and Identity import CSVs alongside the JSON'
+    )
+    parser.add_argument(
+        '--chunk',
+        type=int,
+        dest='chunk_size',
+        metavar='N',
+        help='Split output into chunks of N DPSKs (e.g., --chunk 500 for 500 per file)'
     )
     return parser.parse_args()
 
@@ -1267,10 +1308,20 @@ def main():
 
         # Save results
         output_dir = args.output_dir or os.getenv('OUTPUT_DIR', './output')
-        output_file = extractor.save_to_file(output_dir)
+        chunk_size = args.chunk_size
+        output_files = extractor.save_to_file(output_dir, chunk_size=chunk_size)
+
+        # Export CSVs if requested
+        if args.export_csv:
+            csv_pairs = extractor.export_csv(output_dir, chunk_size=chunk_size)
+            print(f"\nCSV exports:")
+            for dpsk_csv, identity_csv in csv_pairs:
+                print(f"  DPSK import:     {dpsk_csv}")
+                print(f"  Identity import: {identity_csv}")
 
         print(f"\nExtraction complete!")
-        print(f"Output saved to: {output_file}")
+        for f in output_files:
+            print(f"Output saved to: {f}")
 
         # Print summary
         print("\nExtracted resources:")

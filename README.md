@@ -1,6 +1,6 @@
 # Cloudpath Configuration Extractor
 
-Extracts configuration data from a Cloudpath Enrollment System deployment via REST API and outputs to JSON.
+Extracts configuration data from a Cloudpath Enrollment System deployment via REST API and outputs to JSON or Cloudpath-compatible CSV import files.
 
 Supports Cloudpath 5.11+ using the `/admin/publicApi` endpoint with JWT authentication.
 
@@ -78,6 +78,29 @@ python cloudpath_extractor.py -p AccountDpskPool-... --full-details
 
 Fetches complete details for each DPSK individually. This is slower but captures all fields including any SSID overrides specific to each DPSK.
 
+### Export as CSV
+
+```bash
+python cloudpath_extractor.py -p AccountDpskPool-... --csv
+```
+
+Generates two Cloudpath-compatible CSV import files alongside the JSON output:
+
+- **DPSK Import CSV** (`*_dpsk_import.csv`) — Columns: `Username`, `Passphrase`, `VLAN ID`, `Expiration Date`, `Start Date`, `Days Until Expiration`, `User Group` (last four left blank). Maps DPSK `name` → Username, `passphrase` → Passphrase, `vlanid` → VLAN ID.
+
+- **Identity Import CSV** (`*_identity_import.csv`) — Columns: `Name`, `Email`, `Description`, `Vlan`. Maps DPSK `name` → Name, `guid` → Description, `vlanid` → Vlan. Email is left blank.
+
+### Chunked Output
+
+```bash
+python cloudpath_extractor.py -p AccountDpskPool-... --chunk 500
+python cloudpath_extractor.py -p AccountDpskPool-... --csv --chunk 500
+```
+
+Splits output into multiple files of N DPSKs each. Useful for large deployments where Cloudpath import has size limits.
+
+For 3,000 DPSKs with `--chunk 500`, you get 6 files with `_chunk1of6`, `_chunk2of6`, etc. in the filenames. Works with both JSON and CSV output. Each chunked file includes chunk metadata (chunk number, total chunks, DPSKs in chunk).
+
 ### Extract All Pools (Use with Caution)
 
 ```bash
@@ -104,7 +127,9 @@ python cloudpath_extractor.py -p AccountDpskPool-... --ssid-match "@SiteA" --nam
 | `--name-match-and-strip` | | Filter by name AND remove matched string from output names |
 | `--full-details` | | Fetch full details for each DPSK (slower, but complete) |
 | `--all-pools-yes-really` | | Extract from ALL pools (requires explicit flag) |
-| `--output-dir` | `-o` | Output directory for JSON files (default: `./output`) |
+| `--csv` | | Export Cloudpath-compatible DPSK and Identity import CSV files |
+| `--chunk` | | Split output into chunks of N DPSKs per file |
+| `--output-dir` | `-o` | Output directory for JSON/CSV files (default: `./output`) |
 
 ## Environment Variables
 
@@ -120,12 +145,17 @@ python cloudpath_extractor.py -p AccountDpskPool-... --ssid-match "@SiteA" --nam
 
 ## Output
 
-JSON files are saved to the output directory with the naming pattern:
+Files are saved to the output directory with the naming pattern:
 ```
 cloudpath_{fqdn}_{timestamp}.json
+cloudpath_{fqdn}_{timestamp}_dpsk_import.csv      (with --csv)
+cloudpath_{fqdn}_{timestamp}_identity_import.csv   (with --csv)
+cloudpath_{fqdn}_{timestamp}_chunk1of3.json        (with --chunk)
 ```
 
 The script maintains only the last 5 output files, automatically deleting older ones.
+
+HATEOAS `links` objects from the Cloudpath API are automatically stripped at ingestion time and will not appear in any output.
 
 ### Example Output
 
